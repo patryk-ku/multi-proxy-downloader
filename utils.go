@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -194,16 +195,35 @@ func DivideFileIntoParts(totalLength int64, partSizeBytes int64) []FilePart {
 	return parts
 }
 
-func DownloadPartialFile(fileURL, proxyURL, outputPath string, startByte, endByte int64, bar *progressbar.ProgressBar) (int64, error) {
-	// Proxy parsing
-	proxy, err := url.Parse(proxyURL)
-	if err != nil {
-		return 0, err
-	}
+type progressReader struct {
+	io.Reader
+	OnRead func()
+}
 
+func (pr *progressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.Reader.Read(p)
+	if n > 0 && pr.OnRead != nil {
+		pr.OnRead()
+	}
+	return
+}
+
+type trackReader struct {
+	io.Reader
+	OnRead func(int)
+}
+
+func (tr *trackReader) Read(p []byte) (n int, err error) {
+	n, err = tr.Reader.Read(p)
+	if n > 0 && tr.OnRead != nil {
+		tr.OnRead(n)
+	}
+	return
+}
+
+func DownloadPartialFile(fileURL, proxyURL, outputPath string, startByte, endByte int64, bar *progressbar.ProgressBar, timeout time.Duration, onProgress func(int64)) (int64, error) {
 	// Transport with custom Dialer and disabled TLS verification
 	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxy),
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second, // TCP connection timeout
 			KeepAlive: 30 * time.Second,
@@ -213,12 +233,25 @@ func DownloadPartialFile(fileURL, proxyURL, outputPath string, startByte, endByt
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, // ignore certificate
 	}
 
+	// Proxy parsing
+	if proxyURL != "" {
+		proxy, err := url.Parse(proxyURL)
+		if err != nil {
+			return 0, err
+		}
+		transport.Proxy = http.ProxyURL(proxy)
+	}
+
 	client := &http.Client{
 		Transport: transport,
 	}
 
-	// Prepare the request with the Range header
-	req, err := http.NewRequest("GET", fileURL, nil)
+	// Create a context that can be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Prepare the request with the Range header and context
+	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -242,15 +275,73 @@ func DownloadPartialFile(fileURL, proxyURL, outputPath string, startByte, endByt
 	}
 	defer file.Close()
 
+	// Setup inactivity timer
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.AfterFunc(timeout, func() {
+			if verbose {
+				log.Debug("Inactivity timeout reached, switching proxy...", "timeout", timeout, "proxy", proxyURL)
+			}
+			cancel()
+		})
+		defer timer.Stop()
+	}
+
+	// Wrap resp.Body to reset timer on each read
+	reader := io.Reader(resp.Body)
+	if timeout > 0 {
+		reader = &progressReader{
+			Reader: reader,
+			OnRead: func() {
+				timer.Reset(timeout)
+			},
+		}
+	}
+
+	// Track downloaded bytes
+	reader = &trackReader{
+		Reader: reader,
+		OnRead: func(n int) {
+			if onProgress != nil {
+				onProgress(int64(n))
+			}
+		},
+	}
+
 	var written int64
 
-	if verbose {
-		written, err = io.Copy(file, resp.Body)
+	if verbose || bar == nil {
+		written, err = io.Copy(file, reader)
 	} else {
-		written, err = io.Copy(io.MultiWriter(file, bar), resp.Body)
+		written, err = io.Copy(io.MultiWriter(file, bar), reader)
 	}
 
 	return written, err
+}
+
+func reportProgress(parts []FilePart, totalDownloaded int64, speed float64, contentLength int64) {
+	totalParts := len(parts)
+	downloadedParts := 0
+	for _, part := range parts {
+		if part.Downloaded {
+			downloadedParts++
+		}
+	}
+
+	etaStr := "-s"
+	if speed > 0 {
+		eta := float64(contentLength-totalDownloaded) / speed
+		etaStr = fmt.Sprintf("%.0fs", eta)
+	}
+
+	log.Info("Download progress",
+		"progress", fmt.Sprintf("%.2f%%", float64(totalDownloaded)/float64(contentLength)*100),
+		"parts", fmt.Sprintf("%d/%d", downloadedParts, totalParts),
+		"downloaded", fmt.Sprintf("%.2f MB", float64(totalDownloaded)/(1024*1024)),
+		"total", fmt.Sprintf("%.2f MB", float64(contentLength)/(1024*1024)),
+		"speed", fmt.Sprintf("%.2f Mbps", (speed*8)/1000000),
+		"eta", etaStr,
+	)
 }
 
 func ConcatenateFiles(outputPath, workDir string) error {
@@ -302,7 +393,7 @@ func ConcatenateFiles(outputPath, workDir string) error {
 	return nil
 }
 
-func PrintDownloadStatus(parts []FilePart, partSize, contentLength int64) {
+func PrintDownloadStatus(parts []FilePart, partSize, contentLength int64, totalDownloaded int64, speed float64) {
 	totalParts := len(parts)
 	downloadedParts := 0
 
@@ -312,17 +403,21 @@ func PrintDownloadStatus(parts []FilePart, partSize, contentLength int64) {
 		}
 	}
 
-	downloadedMB := float64(downloadedParts*int(partSize)) / (1024 * 1024)
-	totalMB := float64(int(contentLength)) / (1024 * 1024)
+	percentage := float64(totalDownloaded) / float64(contentLength) * 100
 
-	if downloadedParts == totalParts {
-		downloadedMB = totalMB
-
+	etaStr := "-s"
+	if speed > 0 {
+		eta := float64(contentLength-totalDownloaded) / speed
+		etaStr = fmt.Sprintf("%.0fs", eta)
 	}
 
-	percentage := float64(downloadedParts) / float64(totalParts) * 100
-
-	log.Print("Downloading file...", "progress", fmt.Sprintf("%05.2f%%", percentage), "parts", fmt.Sprintf("%d/%d", downloadedParts, totalParts), "size", fmt.Sprintf("%.2f MB / %.2f MB", downloadedMB, totalMB))
+	log.Print("Downloading file...",
+		"progress", fmt.Sprintf("%05.2f%%", percentage),
+		"parts", fmt.Sprintf("%d/%d", downloadedParts, totalParts),
+		"size", fmt.Sprintf("%.2f MB / %.2f MB", float64(totalDownloaded)/(1024*1024), float64(contentLength)/(1024*1024)),
+		"speed", fmt.Sprintf("%.2f Mbps", (speed*8)/1000000),
+		"eta", etaStr,
+	)
 }
 
 func DetailsPrompt(parts []FilePart, proxyErrors int) string {

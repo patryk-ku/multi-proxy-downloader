@@ -1,9 +1,6 @@
-name: release
+name: build
 
-on:
-    push:
-        tags:
-            - "**"
+on: workflow_dispatch
 
 permissions:
     contents: write
@@ -47,23 +44,3 @@ jobs:
               with:
                   name: ${{ matrix.os }}
                   path: artifact
-
-    release:
-        runs-on: ubuntu-latest
-        needs: build
-        steps:
-            - uses: actions/checkout@v4
-
-            - name: Download all artifacts
-              uses: actions/download-artifact@v4
-              with:
-                  path: ./artifacts
-
-            - name: Display downloaded files
-              run: ls -lR ./artifacts
-
-            - name: GH Release
-              uses: softprops/action-gh-release@v2.4.1
-              with:
-                  body_path: .github/release-notes.md
-                  files: ./artifacts/**/*

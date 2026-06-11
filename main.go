@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
@@ -21,6 +22,7 @@ var (
 	partSizeBytes          int64
 	maxConcurrentDownloads int
 	proxyMaxRetry          int
+	proxyTimeout           int
 	proxiesFilePath        string
 	verbose                bool
 	jsonOutput             bool
@@ -29,7 +31,7 @@ var (
 	overwrite              bool
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 func main() {
 	flag.StringVar(&fileURL, "url", "", "URL of the file to download")
@@ -37,14 +39,19 @@ func main() {
 	flag.StringVar(&proxiesFilePath, "proxy", "proxies.txt", "Path to a file containing a list of proxy addresses")
 	flag.IntVar(&maxConcurrentDownloads, "max", 30, "Maximum number of concurrent downloads")
 	flag.IntVar(&proxyMaxRetry, "retry", 2, "Number of retries for a part before switching to the next proxy")
+	flag.IntVar(&proxyTimeout, "timeout", 20, "Timeout in seconds for inactivity before switching proxy")
 	partSizeFlag := flag.Int("part", 10, "Size of each download part in megabytes (MB)")
 	flag.BoolVar(&verbose, "verbose", false, "Disable the progress bar and show logs instead")
-	flag.BoolVar(&jsonOutput, "json-output", false, "Enable JSON formatted output for logs")
+	flag.BoolVar(&jsonOutput, "json-output", false, "Enable JSON formatted output for logs (automatically enables --verbose, reports progress every 5s)")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&debugProxy, "debug-proxy", false, "Enable debug logging for proxy operations")
 	versionFlag := flag.Bool("v", false, "Display the application version and exit")
 	flag.BoolVar(&overwrite, "overwrite", false, "Overwrite the output file if it already exists")
 	flag.Parse()
+
+	if jsonOutput {
+		verbose = true
+	}
 
 	if *versionFlag {
 		fmt.Println("multi-proxy-downloader version:", version)
@@ -188,11 +195,59 @@ func main() {
 	wg.Add(maxConcurrentDownloads)
 
 	var mu sync.Mutex
+	var totalDownloaded int64
+	progressUpdateChan := make(chan struct{}, 1)
+
+	type dataPoint struct {
+		timestamp time.Time
+		bytes     int64
+	}
+	var history []dataPoint
+
+	calculateCurrentSpeed := func() float64 {
+		now := time.Now()
+		history = append(history, dataPoint{timestamp: now, bytes: totalDownloaded})
+		for len(history) > 0 && now.Sub(history[0].timestamp) > 10*time.Second {
+			history = history[1:]
+		}
+		if len(history) > 1 {
+			duration := history[len(history)-1].timestamp.Sub(history[0].timestamp).Seconds()
+			if duration > 0 {
+				return float64(history[len(history)-1].bytes-history[0].bytes) / duration
+			}
+		}
+		return 0.0
+	}
+
+	// Periodic JSON reporting
+	if jsonOutput {
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					mu.Lock()
+					currentSpeed := calculateCurrentSpeed()
+					reportProgress(fileParts, totalDownloaded, currentSpeed, contentLength)
+					mu.Unlock()
+				case <-progressUpdateChan:
+					ticker.Reset(5 * time.Second)
+					mu.Lock()
+					currentSpeed := calculateCurrentSpeed()
+					reportProgress(fileParts, totalDownloaded, currentSpeed, contentLength)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
 
 	// Progress bar
 	var bar *progressbar.ProgressBar
 	if verbose {
-		PrintDownloadStatus(fileParts, partSizeBytes, contentLength)
+		mu.Lock()
+		PrintDownloadStatus(fileParts, partSizeBytes, contentLength, totalDownloaded, 0)
+		mu.Unlock()
 	} else {
 		bar = progressbar.NewOptions(int(contentLength),
 			progressbar.OptionSetMaxDetailRow(1),
@@ -227,8 +282,16 @@ func main() {
 						}
 						mu.Lock()
 						fileParts[part.Number].Downloaded = true
+						totalDownloaded += partSize
 						if verbose {
-							PrintDownloadStatus(fileParts, partSizeBytes, contentLength)
+							if jsonOutput {
+								select {
+								case progressUpdateChan <- struct{}{}:
+								default:
+								}
+							} else {
+								PrintDownloadStatus(fileParts, partSizeBytes, contentLength, totalDownloaded, calculateCurrentSpeed())
+							}
 						} else {
 							bar.AddDetail(DetailsPrompt(fileParts, pool.errorCount))
 						}
@@ -259,7 +322,13 @@ func main() {
 						}
 					}
 
-					downloadedBytes, err := DownloadPartialFile(fileURL, proxyURL, partAbsPath, part.Start, part.End, bar)
+					var localDownloaded int64
+					downloadedBytes, err := DownloadPartialFile(fileURL, proxyURL, partAbsPath, part.Start, part.End, bar, time.Duration(proxyTimeout)*time.Second, func(n int64) {
+						mu.Lock()
+						totalDownloaded += n
+						localDownloaded += n
+						mu.Unlock()
+					})
 					if err != nil {
 						if verbose && debugProxy {
 							log.Debug(fmt.Sprintf("Worker %d: Error downloading part %d.", workerID, part.Number), "err", err)
@@ -269,6 +338,11 @@ func main() {
 						if !verbose {
 							bar.Add(-int(downloadedBytes))
 						}
+
+						// Reset global counter for the failed part
+						mu.Lock()
+						totalDownloaded -= localDownloaded
+						mu.Unlock()
 
 						// Retry indefinitely
 						retryCounter++
@@ -285,6 +359,10 @@ func main() {
 						if !verbose {
 							bar.Add(-int(downloadedBytes))
 						}
+
+						mu.Lock()
+						totalDownloaded -= localDownloaded
+						mu.Unlock()
 
 						retryCounter++
 						continue
@@ -303,6 +381,10 @@ func main() {
 							bar.Add(-int(downloadedBytes))
 						}
 
+						mu.Lock()
+						totalDownloaded -= localDownloaded
+						mu.Unlock()
+
 						retryCounter++
 						continue
 					}
@@ -312,8 +394,16 @@ func main() {
 
 					mu.Lock()
 					fileParts[part.Number].Downloaded = true
+
 					if verbose {
-						PrintDownloadStatus(fileParts, partSizeBytes, contentLength)
+						if jsonOutput {
+							select {
+							case progressUpdateChan <- struct{}{}:
+							default:
+							}
+						} else {
+							PrintDownloadStatus(fileParts, partSizeBytes, contentLength, totalDownloaded, calculateCurrentSpeed())
+						}
 					} else {
 						bar.AddDetail(DetailsPrompt(fileParts, pool.errorCount))
 					}
