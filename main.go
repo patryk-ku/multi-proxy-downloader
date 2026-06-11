@@ -29,7 +29,7 @@ var (
 	overwrite              bool
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 func main() {
 	flag.StringVar(&fileURL, "url", "", "URL of the file to download")
