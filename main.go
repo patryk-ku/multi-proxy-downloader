@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
@@ -21,6 +22,7 @@ var (
 	partSizeBytes          int64
 	maxConcurrentDownloads int
 	proxyMaxRetry          int
+	proxyTimeout           int
 	proxiesFilePath        string
 	verbose                bool
 	jsonOutput             bool
@@ -37,14 +39,19 @@ func main() {
 	flag.StringVar(&proxiesFilePath, "proxy", "proxies.txt", "Path to a file containing a list of proxy addresses")
 	flag.IntVar(&maxConcurrentDownloads, "max", 30, "Maximum number of concurrent downloads")
 	flag.IntVar(&proxyMaxRetry, "retry", 2, "Number of retries for a part before switching to the next proxy")
+	flag.IntVar(&proxyTimeout, "timeout", 20, "Timeout in seconds for inactivity before switching proxy")
 	partSizeFlag := flag.Int("part", 10, "Size of each download part in megabytes (MB)")
 	flag.BoolVar(&verbose, "verbose", false, "Disable the progress bar and show logs instead")
-	flag.BoolVar(&jsonOutput, "json-output", false, "Enable JSON formatted output for logs")
+	flag.BoolVar(&jsonOutput, "json-output", false, "Enable JSON formatted output for logs (automatically enables --verbose)")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 	flag.BoolVar(&debugProxy, "debug-proxy", false, "Enable debug logging for proxy operations")
 	versionFlag := flag.Bool("v", false, "Display the application version and exit")
 	flag.BoolVar(&overwrite, "overwrite", false, "Overwrite the output file if it already exists")
 	flag.Parse()
+
+	if jsonOutput {
+		verbose = true
+	}
 
 	if *versionFlag {
 		fmt.Println("multi-proxy-downloader version:", version)
@@ -259,7 +266,7 @@ func main() {
 						}
 					}
 
-					downloadedBytes, err := DownloadPartialFile(fileURL, proxyURL, partAbsPath, part.Start, part.End, bar)
+					downloadedBytes, err := DownloadPartialFile(fileURL, proxyURL, partAbsPath, part.Start, part.End, bar, time.Duration(proxyTimeout)*time.Second)
 					if err != nil {
 						if verbose && debugProxy {
 							log.Debug(fmt.Sprintf("Worker %d: Error downloading part %d.", workerID, part.Number), "err", err)

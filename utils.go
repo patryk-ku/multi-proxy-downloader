@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -194,16 +195,22 @@ func DivideFileIntoParts(totalLength int64, partSizeBytes int64) []FilePart {
 	return parts
 }
 
-func DownloadPartialFile(fileURL, proxyURL, outputPath string, startByte, endByte int64, bar *progressbar.ProgressBar) (int64, error) {
-	// Proxy parsing
-	proxy, err := url.Parse(proxyURL)
-	if err != nil {
-		return 0, err
-	}
+type progressReader struct {
+	io.Reader
+	OnRead func()
+}
 
+func (pr *progressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.Reader.Read(p)
+	if n > 0 && pr.OnRead != nil {
+		pr.OnRead()
+	}
+	return
+}
+
+func DownloadPartialFile(fileURL, proxyURL, outputPath string, startByte, endByte int64, bar *progressbar.ProgressBar, timeout time.Duration) (int64, error) {
 	// Transport with custom Dialer and disabled TLS verification
 	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxy),
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second, // TCP connection timeout
 			KeepAlive: 30 * time.Second,
@@ -213,12 +220,25 @@ func DownloadPartialFile(fileURL, proxyURL, outputPath string, startByte, endByt
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, // ignore certificate
 	}
 
+	// Proxy parsing
+	if proxyURL != "" {
+		proxy, err := url.Parse(proxyURL)
+		if err != nil {
+			return 0, err
+		}
+		transport.Proxy = http.ProxyURL(proxy)
+	}
+
 	client := &http.Client{
 		Transport: transport,
 	}
 
-	// Prepare the request with the Range header
-	req, err := http.NewRequest("GET", fileURL, nil)
+	// Create a context that can be cancelled
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Prepare the request with the Range header and context
+	req, err := http.NewRequestWithContext(ctx, "GET", fileURL, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -242,12 +262,35 @@ func DownloadPartialFile(fileURL, proxyURL, outputPath string, startByte, endByt
 	}
 	defer file.Close()
 
+	// Setup inactivity timer
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.AfterFunc(timeout, func() {
+			if verbose {
+				log.Debug("Inactivity timeout reached, switching proxy...", "timeout", timeout, "proxy", proxyURL)
+			}
+			cancel()
+		})
+		defer timer.Stop()
+	}
+
+	// Wrap resp.Body to reset timer on each read
+	reader := io.Reader(resp.Body)
+	if timeout > 0 {
+		reader = &progressReader{
+			Reader: resp.Body,
+			OnRead: func() {
+				timer.Reset(timeout)
+			},
+		}
+	}
+
 	var written int64
 
-	if verbose {
-		written, err = io.Copy(file, resp.Body)
+	if verbose || bar == nil {
+		written, err = io.Copy(file, reader)
 	} else {
-		written, err = io.Copy(io.MultiWriter(file, bar), resp.Body)
+		written, err = io.Copy(io.MultiWriter(file, bar), reader)
 	}
 
 	return written, err
