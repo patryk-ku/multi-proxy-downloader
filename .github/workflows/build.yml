@@ -1,0 +1,46 @@
+name: build
+
+on: workflow_dispatch
+
+permissions:
+    contents: write
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    build:
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                include:
+                    - os: windows-latest
+                      target: multi-proxy-downloader-win-x64.exe
+                    - os: ubuntu-latest
+                      target: multi-proxy-downloader-linux-x64
+                    - os: macos-latest
+                      target: multi-proxy-downloader-macos-arm64
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Go
+              uses: actions/setup-go@v4
+              with:
+                  go-version: "stable"
+
+            - name: Build
+              run: |
+                  go mod tidy
+                  go build -ldflags "-w -s" -o "${{ matrix.target }}"
+
+            - name: Prepare artifact
+              run: |
+                  mkdir artifact
+                  mv ${{ matrix.target }} artifact
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ matrix.os }}
+                  path: artifact
