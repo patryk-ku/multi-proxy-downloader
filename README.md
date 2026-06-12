@@ -22,28 +22,30 @@ Launch executable with `-h` for aditional info:
 ```
 Usage of multi-proxy-downloader:
   -debug
-    	Enable debug logging
+        Enable debug logging
   -debug-proxy
-    	Enable debug logging for proxy operations
+        Enable debug logging for proxy operations
   -json-output
-    	Enable JSON formatted output for logs
+        Enable JSON formatted output for logs (automatically enables --verbose, reports progress every 5s)
   -max int
-    	Maximum number of concurrent downloads (default 30)
+        Maximum number of concurrent downloads (default 30)
   -output string
-    	Path to save the downloaded file
+        Path to save the downloaded file
   -overwrite
-    	Overwrite the output file if it already exists
+        Overwrite the output file if it already exists
   -part int
-    	Size of each download part in megabytes (MB) (default 10)
+        Size of each download part in megabytes (MB) (default 10)
   -proxy string
-    	Path to a file containing a list of proxy addresses (default "proxies.txt")
+        Path to a file containing a list of proxy addresses (default "proxies.txt")
   -retry int
-    	Number of retries for a part before switching to the next proxy (default 2)
+        Number of retries for a part before switching to the next proxy (default 2)
+  -timeout int
+        Timeout in seconds for inactivity before switching proxy (default 20)
   -url string
-    	URL of the file to download
-  -v	Display the application version and exit
+        URL of the file to download
+  -v    Display the application version and exit
   -verbose
-    	Disable the progress bar and show logs instead
+        Disable the progress bar and show logs instead
 ```
 
 **Example:**
